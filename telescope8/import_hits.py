@@ -8,7 +8,7 @@ from ROOT import gROOT, TFile, TTree
 
 indata = "fatras/hits.root"
 outdata = "hits.hdf5"
-max_hits = 9*8 #maximum number of hits per event - this assumes 9 detector layers and 2 particles
+max_hits = 9*8 #maximum number of hits per event - this assumes 9 detector layers and 8 particles
 
 def main(argv):
     gROOT.SetBatch(True)
