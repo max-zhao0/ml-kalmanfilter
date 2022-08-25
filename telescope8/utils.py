@@ -97,6 +97,7 @@ def get_telescope_layer_data(hit_data_path, training_prop, nparticles, nlayers=9
     data = np.zeros((nevents, nlayers, nparticles, len(hit_info)))
     key = np.zeros((nevents, nlayers, nparticles))
     
+    # To do: replace some of these loops with tensor manipulation to save time
     for event_no in range(nevents):
         for hit_no in range(nlayers * nparticles):
             layer_no = int(hits["layer_id"][event_no,hit_no] / 2 - 1)
