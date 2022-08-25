@@ -9,14 +9,14 @@ def create_hit_pairs(data, key):
     Generate pairs of hits on adjacent layers and a corresponding score for if it is the correct propagation decision.
 
     Inputs
-    ---
-    data        : float (number of events, number of layers, max hits per layer, parameters per hit)
-    key         : float (number of events, number of layers, max hits per layer)
+    --- 
+    data        : hit data                                          : float (number of events, number of layers, max hits per layer, parameters per hit)
+    key         : particle ids                                      : float (number of events, number of layers, max hits per layer)
 
     Outputs
     ---
-    features    : float (number of training examples, parameters per hit * 2)
-    labels      : int   (number of training examples)
+    features    : Pairs of hits concatenated                        : float (number of training examples, parameters per hit * 2)
+    labels      : Binary label for if pair is from the same track   : int   (number of training examples)
     """
     assert data.shape[:3] == key.shape
 
@@ -27,7 +27,8 @@ def create_hit_pairs(data, key):
             for hit_no in range(data.shape[2]):
                 if key[event_no,layer_no,hit_no] == 0:
                     break
-
+                
+                # Search for matching hits on next layer
                 found_match = False
                 for hit_no2 in range(data.shape[2]):
                     if key[event_no,layer_no+1,hit_no2] == 0:
@@ -41,6 +42,7 @@ def create_hit_pairs(data, key):
                     features.append(pair)
                     labels.append(label)
                 
+                # If no matching hit is found on the next layer, the correct choice is to terminate the track, represented as all zeros hit
                 terminal_pair = tf.concat([data[event_no,layer_no,hit_no], tf.zeros(data.shape[3], dtype=data.dtype)], 0)
                 terminal_label = 0 if found_match else 1
                 features.append(terminal_pair)
@@ -61,6 +63,7 @@ def main(argv):
     test_feat, test_labels = create_hit_pairs(test_data, test_key)
     print(train_feat.shape)
 
+    # Size can be modified for performance and accuracy needs
     PolicyModel = keras.Sequential([
         keras.layers.Dense(64, activation=tf.nn.relu),
         keras.layers.Dense(64, activation=tf.nn.relu),
@@ -74,6 +77,8 @@ def main(argv):
         metrics=[tf.keras.metrics.BinaryAccuracy(), tf.keras.metrics.FalseNegatives()]
     )
     for epochs in range(7):
+        # Since training is not very intensive, evaluate and save after every epoch to check for overfitting
+        
         PolicyModel.fit(train_feat, train_labels, epochs=1)
         print()
         result = PolicyModel.evaluate(test_feat, test_labels)
