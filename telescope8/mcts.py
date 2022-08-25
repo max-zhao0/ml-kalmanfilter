@@ -6,6 +6,28 @@ import sys
 from scipy import stats
 
 def get_telescope_layer_data(hit_data, training_prop, nparticles, nlayers=9, hit_info=["tx", "ty", "tz", "tt"], event_lim=None):
+    """
+    Reorganize data into shape well suited for tracking algorithm.
+    Data is in the form of ragged tensors where each layer has a variable number of hits.
+    The first hit per layer will be all zeros signifying end of track.
+    
+    Inputs
+    ---
+    hit_data        : path to hit data                                  : string
+    training_prop   : proportion of data to be reserved for training    : float
+    nparticles      : max particles per event                           : int
+    nlayers         : # of layers in detector                           : int
+    hit_info        : hit paramaters to be used in tracking             : string (# of hit parameters)
+    event_lim       : For troubleshooting                               : int
+    
+    Outputs
+    ---
+    training_data   : (# of events * training_prop, nlayers, None, # of hit parameters)
+    training_key    : (# of events * training_prop, nlayers, None)
+    testing_data    : (# of events * (1 - training_prop), nlayers, None, # of hit parameters)
+    testing_key     : (# of events * (1 - training_prop), nlayers, None)
+    hit_info        : string (# of hit parameters)
+    """
     f = h5py.File(hit_data, "r")
     hits = f["hitinfo"]
 
@@ -40,19 +62,38 @@ def get_telescope_layer_data(hit_data, training_prop, nparticles, nlayers=9, hit
     return data[:ntraining], key[:ntraining], data[ntraining:], key[ntraining:], hit_info
 
 def naive_tracking(event, Policy, truth=None):
+    """
+    Tracking with policy network only
+    
+    Input
+    ---
+    event           : event to be tracked       : float (# of layers, None, # of hit parameters)
+    Policy          : policy network            : keras.Model
+    truth           : particle ids for event    : float (# of layers, None)
+    
+    Output
+    ---
+    tracks          : list of lists of hits, each sublist is a track
+    truth_tracks    : list of lists of particle_ids, each sublist is a track
+    """
     if truth is None:
+        # If truth is not provided just use zero tensor of same shape and discard at the end
         truth = tf.ragged.map_flat_values(lambda x: 0, event)
     
     tracks = []
     truth_tracks = []
     for track_no in range(1, event[0].shape[0]):
+        # Hits in the first layer are used in lieu of seeds
         track = [event[0,track_no]]
         truth_track = [truth[0,track_no]]
 
+        # Assume at most one hit per track per layer
         for layer_no in range(1, event.shape[0]):
             current_hit_expanded = tf.repeat(tf.expand_dims(track[-1], 0), event[layer_no].shape[0], 0) 
             policy_input = tf.concat([current_hit_expanded, event[layer_no].to_tensor()], 1)
             distr = tf.reshape(Policy(policy_input), [-1])
+            
+            # Add hit with highest rating by policy network
             choice = np.argmax(distr)
             if choice == 0:
                 break
@@ -74,7 +115,7 @@ class Tree:
         self.coord = coordinate
 
 class Edge:
-    u_bias = 1
+    u_bias = 1 # tuneable parameter to determine how much exploring is encouraged
     def __init__(self, top, prior, bottom=None):
         self.top = top
         self.bottom = bottom
@@ -82,32 +123,56 @@ class Edge:
         self.count = 0
         self.result_sum = 0
     def action_val(self):
+        # Average rating of the edge, currently used to make final decision
         return self.result_sum / self.count if self.count else 0.5
     def sim_val(self):
+        # Simulation value used when traversing the tree
         return self.action_val() + self.u_bias * self.prior / (1 + self.count)
     def update(self, result):
+        # Update edge with new result
         self.count += 1
         self.result_sum += result
 
 def tracking(event, Policy, Evaluate, truth=None):
+    """
+    Tracking with Monte Carlo Tree Search
+    
+    Inputs
+    ---
+    event           : event to be tracked       : float (# of layers, None, # of hit parameters)
+    Policy          : policy network            : keras.Model
+    Evaluate        : evaluation network        : keras.Model
+    truth           : particle ids for event    : float (# of layers, None)
+    
+    Output
+    ---
+    tracks          : list of lists of hits, each sublist is a track
+    truth_tracks    : list of lists of particle_ids, each sublist is a track
+    """
     if truth is None:
+        # If truth is not provided just use zero tensor of same shape and discard at the end
         truth = tf.ragged.map_flat_values(lambda x: 0, event)
     reduce = lambda v: np.array(v) / tf.reduce_sum(v)
 
     tracks = []
     truth_tracks = []
     for track_no in range(1, event[0].shape[0]):
+        # Hits in the first layer are used in lieu of seeds
         track = [event[0,track_no]]
         truth_track = [truth[0,track_no]]
         hit_tree = Tree(None, (0, track_no), event[0,track_no], truth[0,track_no])
 
         for layer_no in range(event.shape[0] - 1): # No need to iterate on final layer
-            niterations = 10 - layer_no # Can replace with better heuristic
+            # Number of iterations to be done before locking in an edge.
+            # Ideally would continue until a desired certainty is achieved
+            niterations = 10 - layer_no
             
             for _ in range(niterations):
+                # candidate track to be evaluated
                 candidate = track.copy()
 
                 # Selection
+                # Reach a leaf node that has not yet been expanded
                 curr_tree = hit_tree
                 while curr_tree.branches:
                     sim_choice = np.argmax([branch.sim_val() for branch in curr_tree.branches])
@@ -117,6 +182,7 @@ def tracking(event, Policy, Evaluate, truth=None):
                 first_choice = None
                 if curr_tree.hit is not None:
                     # Expansion
+                    # Expand leaf and imbue each new edge with a prior pobability given by the policy network
                     if curr_tree.coord[0] >= event.shape[0] - 1: # End of detector
                         final_edge = Edge(curr_tree, 1)
                         final_edge.bottom = Tree(final_edge, None, None, None)
@@ -136,6 +202,7 @@ def tracking(event, Policy, Evaluate, truth=None):
                             curr_tree.branches.append(new_edge)
 
                     # MC Playout
+                    # MC playout is done with random sampling of distribution given by Policy
                     first_choice = np.random.choice(len(curr_tree.branches), p=reduce([branch.prior for branch in curr_tree.branches]).numpy())
                     candidate.append(curr_tree.branches[first_choice].bottom.hit)
                     curr_layer = curr_tree.coord[0] + 1 #curr_tree.branches[first_choice].bottom.coord[0]
@@ -158,6 +225,7 @@ def tracking(event, Policy, Evaluate, truth=None):
                         curr_layer += 1
                 
                 # Backpropagation
+                # Update each visited edge with result of MC playout
                 assert candidate[-1] is None and candidate[-2] is not None
                 quality = Evaluate(tf.expand_dims(tf.stack(candidate[:-1]), 0))[0,0].numpy()
                 if first_choice is not None:
@@ -173,6 +241,7 @@ def tracking(event, Policy, Evaluate, truth=None):
             else:
                 track.append(hit_tree.branches[best_choice].bottom.hit)
                 truth_track.append(hit_tree.branches[best_choice].bottom.truth)
+            # Discard branches that are no longer relevent
             hit_tree = hit_tree.branches[best_choice].bottom
             hit_tree.parent = None
     
@@ -182,11 +251,25 @@ def tracking(event, Policy, Evaluate, truth=None):
     return tracks if truth is None else (tracks, truth_tracks)
 
 def track_metrics(truth_set, keys):
+    """
+    Compute average efficiency and purity of tracks provided
+    
+    Inputs
+    ---
+    truth_sets  : particle_ids corresponding to each event          : ragged tensor (# of events, # of layers, None)
+    keys        : list of truth_tracks corresponding to each event  : nested list (# of events, # of tracks, # of hits in track)
+    
+    Outputs
+    ---
+    efficiency  : Proportion of hits sucessfully captured           : float
+    purity      : Proportion of correct hits to total hits          : float
+    """
     eff_sum = 0
     purity_sum = 0
     count = 0
 
     for event_no, truth_tracks in enumerate(truth_set):
+        # Find number of hits left by each particle in the event
         total_frequency = {}
         for layer_no in range(keys[event_no].shape[0]):
             for hit_no in range(keys[event_no][layer_no].shape[0]):
@@ -196,6 +279,7 @@ def track_metrics(truth_set, keys):
                 else:
                     total_frequency[particle_id] = 1
         print(total_frequency)
+        
         for track in truth_tracks:
             try:
                 count += 1
